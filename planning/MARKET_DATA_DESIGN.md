@@ -783,3 +783,58 @@ API handler
 | Remove ticker with open position | Watchlist removal succeeds; position remains in portfolio |
 | Ticker not in `SEED_PRICES` | Simulator assigns random price $50-$300 and `DEFAULT_PARAMS` |
 
+
+---
+
+## 12. Testing Strategy
+
+Tests live in `backend/tests/market/`. 73 tests across 6 modules, 84% coverage.
+
+### Test Modules
+
+| Module | Tests | What it covers |
+|--------|-------|----------------|
+| `test_models.py` | 11 | PriceUpdate creation, computed properties, `to_dict()`, edge cases (zero price) |
+| `test_cache.py` | 13 | Update, get, get_all, remove, version counter, `__contains__`, `__len__` |
+| `test_simulator.py` | 17 | GBM step math, add/remove ticker, Cholesky rebuild, shock events, seed prices |
+| `test_simulator_source.py` | 10 | Start/stop lifecycle, cache seeding, add/remove integration |
+| `test_factory.py` | 7 | Env var selection logic, returns correct type, unstarted state |
+| `test_massive.py` | 13 | Poll parsing, timestamp conversion, malformed snapshot handling, error resilience |
+
+### Key Test Patterns
+
+```python
+# test_models.py — computed properties
+def test_direction_up():
+    update = PriceUpdate(ticker="AAPL", price=191.0, previous_price=190.0)
+    assert update.direction == "up"
+    assert update.change == 1.0
+
+# test_cache.py — version increments
+def test_version_increments():
+    cache = PriceCache()
+    assert cache.version == 0
+    cache.update("AAPL", 190.0)
+    assert cache.version == 1
+
+# test_simulator.py — prices stay positive
+def test_prices_never_negative():
+    sim = GBMSimulator(["AAPL", "TSLA"])
+    for _ in range(1000):
+        prices = sim.step()
+        assert all(p > 0 for p in prices.values())
+
+# test_factory.py — env-based selection
+def test_simulator_when_no_key(monkeypatch):
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    source = create_market_data_source(PriceCache())
+    assert isinstance(source, SimulatorDataSource)
+```
+
+### Coverage Gaps (Acceptable)
+
+| Module | Coverage | Why |
+|--------|----------|-----|
+| `massive_client.py` | 56% | Real API methods mocked; full coverage requires live API |
+| `stream.py` | 31% | SSE generator needs running ASGI server (`httpx.AsyncClient`) |
+
