@@ -212,3 +212,71 @@ while True:
 - `threading.Lock` works correctly from both sync threads and the async event loop.
 - Memory is bounded at O(tickers) since only the latest price per ticker is stored.
 
+
+---
+
+## 4. Abstract Interface
+
+**File: `backend/app/market/interface.py`**
+
+The strategy pattern contract. Both `SimulatorDataSource` and `MassiveDataSource` implement this ABC. Downstream code never knows which is active.
+
+```python
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+
+class MarketDataSource(ABC):
+    """Contract for market data providers.
+
+    Implementations push price updates into a shared PriceCache on their own
+    schedule. Downstream code never calls the data source directly for prices —
+    it reads from the cache.
+
+    Lifecycle:
+        source = create_market_data_source(cache)
+        await source.start(["AAPL", "GOOGL", ...])
+        # ... app runs ...
+        await source.add_ticker("TSLA")
+        await source.remove_ticker("GOOGL")
+        # ... app shutting down ...
+        await source.stop()
+    """
+
+    @abstractmethod
+    async def start(self, tickers: list[str]) -> None:
+        """Begin producing price updates. Starts a background task.
+        Must be called exactly once."""
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop background task and release resources. Safe to call multiple times."""
+
+    @abstractmethod
+    async def add_ticker(self, ticker: str) -> None:
+        """Add a ticker to the active set. No-op if already present."""
+
+    @abstractmethod
+    async def remove_ticker(self, ticker: str) -> None:
+        """Remove a ticker from the active set. Also removes from PriceCache."""
+
+    @abstractmethod
+    def get_tickers(self) -> list[str]:
+        """Return the current list of actively tracked tickers."""
+```
+
+### Why Push-to-Cache Instead of Returning Prices?
+
+The push model decouples timing. The simulator ticks at 500ms, Massive polls at 15s, but SSE always reads from the cache at its own 500ms cadence. The SSE layer doesn't need to know which data source is active or what its update interval is.
+
+### Interface Guarantees
+
+| Method | Idempotency | Thread Safety |
+|--------|-------------|---------------|
+| `start()` | Call once only | N/A — called at startup |
+| `stop()` | Safe to call multiple times | N/A — called at shutdown |
+| `add_ticker()` | No-op if already present | Safe from async context |
+| `remove_ticker()` | No-op if not present | Safe from async context |
+| `get_tickers()` | Always safe | Returns a copy |
+
