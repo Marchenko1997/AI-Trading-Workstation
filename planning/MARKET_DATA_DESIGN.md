@@ -720,3 +720,66 @@ async def remove_from_watchlist(ticker: str):
     await market_source.remove_ticker(ticker)  # Also clears from PriceCache
 ```
 
+
+---
+
+## 11. Watchlist Coordination
+
+The watchlist is the bridge between the database (persistent) and the market data source (in-memory). Three actors can modify it:
+
+### Modification Sources
+
+| Actor | How | Example |
+|-------|-----|---------|
+| User (UI) | `POST /api/watchlist` / `DELETE /api/watchlist/{ticker}` | Click "Add PYPL" |
+| AI Chat | LLM structured output `watchlist_changes` | "Add PYPL to your watchlist" |
+| App startup | Load from SQLite `watchlist` table | Initial 10 default tickers |
+
+### Flow: Adding a Ticker
+
+```
+User/AI request
+    │
+    ▼
+API handler validates ticker (uppercase, strip whitespace)
+    │
+    ├──→ INSERT into SQLite watchlist table (persist)
+    │
+    ├──→ await market_source.add_ticker("PYPL")
+    │       │
+    │       ├── Simulator: adds to GBMSimulator, seeds cache, rebuilds Cholesky
+    │       └── Massive: appends to ticker list, appears on next poll
+    │
+    └──→ Return success to client
+```
+
+### Flow: Removing a Ticker
+
+```
+User/AI request
+    │
+    ▼
+API handler
+    │
+    ├──→ DELETE from SQLite watchlist table
+    │
+    ├──→ await market_source.remove_ticker("PYPL")
+    │       │
+    │       ├── Simulator: removes from GBMSimulator, rebuilds Cholesky
+    │       └── Massive: removes from ticker list
+    │
+    ├──→ price_cache.remove("PYPL")  (handled inside remove_ticker)
+    │
+    └──→ Return success — SSE stops including PYPL on next tick
+```
+
+### Edge Cases
+
+| Case | Behavior |
+|------|----------|
+| Add duplicate ticker | No-op at both DB (UNIQUE constraint) and source level |
+| Remove non-existent ticker | No-op — `remove_ticker` is idempotent |
+| Add ticker while Massive is between polls | Ticker appears on next poll cycle |
+| Remove ticker with open position | Watchlist removal succeeds; position remains in portfolio |
+| Ticker not in `SEED_PRICES` | Simulator assigns random price $50-$300 and `DEFAULT_PARAMS` |
+
