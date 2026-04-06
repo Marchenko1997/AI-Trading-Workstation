@@ -889,3 +889,62 @@ def test_simulator_when_no_key(monkeypatch):
 | Add ticker already in watchlist | No-op at both DB (UNIQUE constraint) and source level |
 | Remove ticker with open position | Allowed — position persists, just no live price updates |
 
+
+---
+
+## 14. Configuration Summary
+
+### Environment Variables
+
+| Variable | Required | Default | Effect |
+|----------|----------|---------|--------|
+| `MASSIVE_API_KEY` | No | (empty) | If set → real market data via Polygon.io. If empty → GBM simulator |
+
+### Tunable Constants
+
+| Constant | Location | Default | Description |
+|----------|----------|---------|-------------|
+| `update_interval` | `SimulatorDataSource.__init__` | `0.5` s | Simulator tick rate |
+| `poll_interval` | `MassiveDataSource.__init__` | `15.0` s | Massive API poll rate (free tier safe) |
+| `event_probability` | `GBMSimulator.__init__` | `0.001` | Chance of random shock per tick per ticker |
+| `DEFAULT_DT` | `GBMSimulator` | `~8.48e-8` | Time step as fraction of trading year |
+| SSE interval | `_generate_events` | `0.5` s | How often SSE checks cache for changes |
+| SSE retry | `_generate_events` | `1000` ms | Browser reconnect delay on disconnect |
+
+### Dependencies
+
+| Package | Version | Used By |
+|---------|---------|---------|
+| `fastapi` | >=0.115.0 | SSE endpoint, API routes |
+| `uvicorn[standard]` | >=0.32.0 | ASGI server |
+| `numpy` | >=2.0.0 | GBM simulator (Cholesky, random normals) |
+| `massive` | >=1.0.0 | Polygon.io REST client (only when `MASSIVE_API_KEY` set) |
+
+### Quick Start
+
+```python
+from app.market import PriceCache, create_market_data_source, create_stream_router
+
+# 1. Create shared cache
+cache = PriceCache()
+
+# 2. Create source (reads MASSIVE_API_KEY automatically)
+source = create_market_data_source(cache)
+
+# 3. Start with initial tickers
+await source.start(["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA",
+                     "NVDA", "META", "JPM", "V", "NFLX"])
+
+# 4. Read prices anywhere in the app
+price = cache.get_price("AAPL")       # float or None
+update = cache.get("AAPL")            # PriceUpdate or None
+all_prices = cache.get_all()          # dict[str, PriceUpdate]
+
+# 5. Dynamic watchlist management
+await source.add_ticker("PYPL")
+await source.remove_ticker("NFLX")
+
+# 6. Clean shutdown
+await source.stop()
+```
+
