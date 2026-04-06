@@ -133,3 +133,82 @@ class PriceUpdate:
 - **`to_dict()`**: Single serialization point used by both SSE endpoint and REST API responses.
 - **Stored fields are minimal** (4 fields). Everything else is computed. This keeps the constructor simple and eliminates the risk of passing inconsistent values.
 
+
+---
+
+## 3. Price Cache
+
+**File: `backend/app/market/cache.py`**
+
+The central data hub. Data sources write to it; SSE streaming and portfolio valuation read from it. Thread-safe because the Massive client runs in `asyncio.to_thread()` while SSE reads happen on the async event loop.
+
+```python
+from __future__ import annotations
+
+import time
+from threading import Lock
+
+from .models import PriceUpdate
+
+
+class PriceCache:
+    def __init__(self) -> None:
+        self._prices: dict[str, PriceUpdate] = {}
+        self._lock = Lock()
+        self._version: int = 0  # Bumped on every update
+
+    def update(self, ticker: str, price: float, timestamp: float | None = None) -> PriceUpdate:
+        with self._lock:
+            ts = timestamp or time.time()
+            prev = self._prices.get(ticker)
+            previous_price = prev.price if prev else price
+            update = PriceUpdate(
+                ticker=ticker,
+                price=round(price, 2),
+                previous_price=round(previous_price, 2),
+                timestamp=ts,
+            )
+            self._prices[ticker] = update
+            self._version += 1
+            return update
+
+    def get(self, ticker: str) -> PriceUpdate | None:
+        with self._lock:
+            return self._prices.get(ticker)
+
+    def get_all(self) -> dict[str, PriceUpdate]:
+        with self._lock:
+            return dict(self._prices)
+
+    def get_price(self, ticker: str) -> float | None:
+        update = self.get(ticker)
+        return update.price if update else None
+
+    def remove(self, ticker: str) -> None:
+        with self._lock:
+            self._prices.pop(ticker, None)
+
+    @property
+    def version(self) -> int:
+        return self._version
+```
+
+### Why a Version Counter?
+
+The SSE loop polls the cache every ~500ms. Without a version counter, it would serialize and send all prices every tick — even when nothing changed (e.g., Massive API only updates every 15s). The version counter enables skip-when-unchanged:
+
+```python
+last_version = -1
+while True:
+    if price_cache.version != last_version:
+        last_version = price_cache.version
+        yield format_sse(price_cache.get_all())
+    await asyncio.sleep(0.5)
+```
+
+### Why `threading.Lock` Instead of `asyncio.Lock`?
+
+- The Massive client's synchronous `get_snapshot_all()` runs via `asyncio.to_thread()` in a real OS thread — `asyncio.Lock` would not protect against that.
+- `threading.Lock` works correctly from both sync threads and the async event loop.
+- Memory is bounded at O(tickers) since only the latest price per ticker is stored.
+
