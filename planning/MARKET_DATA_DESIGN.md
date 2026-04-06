@@ -1016,3 +1016,129 @@ Cholesky `L` of this matrix ensures `L @ L^T = C`. Independent draws multiplied 
 - `remove_ticker()`: removes from list/dicts, rebuilds Cholesky
 - Rebuild is O(n^2) but n < 50 tickers — negligible cost
 
+
+---
+
+## 15. Production Improvements
+
+Three enhancements for production readiness beyond the core implementation.
+
+### 15.1 Massive API Fallback Strategy
+
+If the Massive API fails repeatedly, the cache serves stale prices indefinitely. Add failure tracking and automatic fallback to the simulator.
+
+```python
+class MassiveDataSource(MarketDataSource):
+    MAX_CONSECUTIVE_FAILURES = 5
+
+    def __init__(self, api_key, price_cache, poll_interval=15.0):
+        # ... existing init ...
+        self._consecutive_failures = 0
+        self._healthy = True
+
+    async def _poll_once(self) -> None:
+        try:
+            snapshots = await asyncio.to_thread(self._fetch_snapshots)
+            self._process_snapshots(snapshots)
+            self._consecutive_failures = 0
+            self._healthy = True
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.error("Massive poll failed (%d/%d): %s",
+                         self._consecutive_failures, self.MAX_CONSECUTIVE_FAILURES, e)
+            if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                self._healthy = False
+
+    @property
+    def is_healthy(self) -> bool:
+        return self._healthy
+```
+
+Expose health via `/api/health` so the frontend can show a warning banner:
+
+```python
+@router.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "market_data": {
+            "source": "massive" if isinstance(market_source, MassiveDataSource) else "simulator",
+            "healthy": getattr(market_source, "is_healthy", True),
+        }
+    }
+```
+
+### 15.2 SSE Backpressure / Broadcast Pattern
+
+Instead of each SSE client independently polling the cache, use a single broadcast producer with a subscriber list.
+
+```python
+class PriceBroadcaster:
+    """Single producer fans out to N SSE subscribers."""
+
+    def __init__(self, price_cache: PriceCache, max_clients: int = 50):
+        self._cache = price_cache
+        self._max_clients = max_clients
+        self._subscribers: dict[str, asyncio.Queue] = {}
+
+    def subscribe(self, client_id: str) -> asyncio.Queue:
+        if len(self._subscribers) >= self._max_clients:
+            raise ConnectionError("Max SSE clients reached")
+        queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        self._subscribers[client_id] = queue
+        return queue
+
+    def unsubscribe(self, client_id: str) -> None:
+        self._subscribers.pop(client_id, None)
+
+    async def broadcast_loop(self, interval: float = 0.5) -> None:
+        """Single loop reads cache, pushes to all subscribers."""
+        last_version = -1
+        while True:
+            current = self._cache.version
+            if current != last_version:
+                last_version = current
+                data = {t: u.to_dict() for t, u in self._cache.get_all().items()}
+                payload = json.dumps(data)
+                for cid, queue in list(self._subscribers.items()):
+                    try:
+                        queue.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        logger.warning("SSE client %s too slow, dropping", cid)
+            await asyncio.sleep(interval)
+```
+
+This replaces N independent cache reads with 1 read + N queue puts per tick.
+
+### 15.3 Cache Staleness Validation for Trades
+
+Trade execution should reject prices that are too old, preventing fills at stale prices when the data source is down.
+
+```python
+class PriceCache:
+    def get_price_if_fresh(
+        self, ticker: str, max_age_seconds: float = 60.0
+    ) -> float | None:
+        """Return price only if updated within max_age_seconds, else None."""
+        update = self.get(ticker)
+        if update is None:
+            return None
+        age = time.time() - update.timestamp
+        if age > max_age_seconds:
+            logger.warning("Stale price for %s: %.1fs old", ticker, age)
+            return None
+        return update.price
+```
+
+Use in the trade handler:
+
+```python
+async def execute_trade(ticker: str, side: str, quantity: float):
+    price = price_cache.get_price_if_fresh(ticker, max_age_seconds=60.0)
+    if price is None:
+        raise HTTPException(400, f"No fresh price for {ticker}. Try again shortly.")
+    # ... proceed with trade at price ...
+```
+
+For the simulator (always fresh at 500ms), this never triggers. For Massive (15s polls), the 60s threshold allows ~4 missed polls before rejecting. Adjust per data source.
+
