@@ -280,3 +280,59 @@ The push model decouples timing. The simulator ticks at 500ms, Massive polls at 
 | `remove_ticker()` | No-op if not present | Safe from async context |
 | `get_tickers()` | Always safe | Returns a copy |
 
+
+---
+
+## 5. Seed Prices & Ticker Parameters
+
+**File: `backend/app/market/seed_prices.py`**
+
+Constants only — no logic, no external imports. Shared by the simulator (initial prices, GBM params, correlation groups) and potentially by the Massive client as fallback prices.
+
+```python
+SEED_PRICES: dict[str, float] = {
+    "AAPL": 190.00,  "GOOGL": 175.00, "MSFT": 420.00,
+    "AMZN": 185.00,  "TSLA": 250.00,  "NVDA": 800.00,
+    "META": 500.00,  "JPM": 195.00,   "V": 280.00,
+    "NFLX": 600.00,
+}
+
+# Per-ticker GBM parameters (sigma = annualized volatility, mu = annualized drift)
+TICKER_PARAMS: dict[str, dict[str, float]] = {
+    "AAPL":  {"sigma": 0.22, "mu": 0.05},
+    "GOOGL": {"sigma": 0.25, "mu": 0.05},
+    "MSFT":  {"sigma": 0.20, "mu": 0.05},
+    "AMZN":  {"sigma": 0.28, "mu": 0.05},
+    "TSLA":  {"sigma": 0.50, "mu": 0.03},   # High volatility
+    "NVDA":  {"sigma": 0.40, "mu": 0.08},   # High volatility, strong drift
+    "META":  {"sigma": 0.30, "mu": 0.05},
+    "JPM":   {"sigma": 0.18, "mu": 0.04},   # Low volatility (bank)
+    "V":     {"sigma": 0.17, "mu": 0.04},   # Low volatility (payments)
+    "NFLX":  {"sigma": 0.35, "mu": 0.05},
+}
+
+DEFAULT_PARAMS: dict[str, float] = {"sigma": 0.25, "mu": 0.05}
+
+CORRELATION_GROUPS: dict[str, set[str]] = {
+    "tech": {"AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "NFLX"},
+    "finance": {"JPM", "V"},
+}
+
+INTRA_TECH_CORR = 0.6       # Tech stocks move together
+INTRA_FINANCE_CORR = 0.5    # Finance stocks move together
+CROSS_GROUP_CORR = 0.3      # Between sectors / unknown tickers
+TSLA_CORR = 0.3             # TSLA does its own thing
+```
+
+### Parameter Rationale
+
+| Ticker | Sigma | Why |
+|--------|-------|-----|
+| TSLA | 0.50 | Highest vol — meme stock energy, dramatic moves |
+| NVDA | 0.40 | AI hype cycle, large intraday swings |
+| NFLX | 0.35 | Earnings-driven vol |
+| V, JPM | 0.17-0.18 | Stable blue-chips, low drama |
+| Others | 0.20-0.30 | Moderate large-cap tech |
+
+Dynamically added tickers (not in `SEED_PRICES`) get a random start price between $50-$300 and `DEFAULT_PARAMS`. They default to `CROSS_GROUP_CORR` (0.3) correlation with all other tickers.
+
