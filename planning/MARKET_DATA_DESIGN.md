@@ -336,3 +336,56 @@ TSLA_CORR = 0.3             # TSLA does its own thing
 
 Dynamically added tickers (not in `SEED_PRICES`) get a random start price between $50-$300 and `DEFAULT_PARAMS`. They default to `CROSS_GROUP_CORR` (0.3) correlation with all other tickers.
 
+
+---
+
+## 6. GBM Simulator
+
+**File: `backend/app/market/simulator.py`**
+
+Two classes: `GBMSimulator` (pure math engine) and `SimulatorDataSource` (async wrapper that writes to `PriceCache`).
+
+### 6.1 GBMSimulator — Core Engine
+
+Each tick applies: `S(t+dt) = S(t) * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)`
+
+Where `dt = 0.5 / (252 * 6.5 * 3600) ≈ 8.48e-8` (500ms as fraction of trading year).
+
+```python
+class GBMSimulator:
+    TRADING_SECONDS_PER_YEAR = 252 * 6.5 * 3600
+    DEFAULT_DT = 0.5 / TRADING_SECONDS_PER_YEAR
+
+    def __init__(self, tickers: list[str], dt=DEFAULT_DT, event_probability=0.001):
+        self._dt = dt
+        self._event_prob = event_probability
+        self._tickers, self._prices, self._params = [], {}, {}
+        self._cholesky: np.ndarray | None = None
+        for ticker in tickers:
+            self._add_ticker_internal(ticker)
+        self._rebuild_cholesky()
+
+    def step(self) -> dict[str, float]:
+        """Advance all tickers one tick. Returns {ticker: new_price}."""
+        n = len(self._tickers)
+        if n == 0:
+            return {}
+        z = np.random.standard_normal(n)
+        if self._cholesky is not None:
+            z = self._cholesky @ z
+        result = {}
+        for i, ticker in enumerate(self._tickers):
+            mu, sigma = self._params[ticker]["mu"], self._params[ticker]["sigma"]
+            drift = (mu - 0.5 * sigma**2) * self._dt
+            diffusion = sigma * math.sqrt(self._dt) * z[i]
+            self._prices[ticker] *= math.exp(drift + diffusion)
+            # Random shock: ~0.1% chance per tick → event every ~50s with 10 tickers
+            if random.random() < self._event_prob:
+                shock = random.uniform(0.02, 0.05) * random.choice([-1, 1])
+                self._prices[ticker] *= (1 + shock)
+            result[ticker] = round(self._prices[ticker], 2)
+        return result
+```
+
+Correlation uses Cholesky decomposition of a sector-based matrix. `_rebuild_cholesky()` is called on add/remove — O(n^2) but n < 50.
+
