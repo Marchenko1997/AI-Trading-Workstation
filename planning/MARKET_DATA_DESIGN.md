@@ -838,3 +838,54 @@ def test_simulator_when_no_key(monkeypatch):
 | `massive_client.py` | 56% | Real API methods mocked; full coverage requires live API |
 | `stream.py` | 31% | SSE generator needs running ASGI server (`httpx.AsyncClient`) |
 
+
+---
+
+## 13. Error Handling & Edge Cases
+
+### Simulator Errors
+
+| Scenario | Handling |
+|----------|----------|
+| `step()` throws exception | Caught in `_run_loop`, logged, loop continues next tick |
+| Cholesky decomposition fails | Only possible with invalid correlation matrix (won't happen with our constants) |
+| Price goes to extreme value | GBM is multiplicative (`exp()`), so prices stay positive. Rounding to 2 decimals caps precision |
+| Zero tickers | `step()` returns `{}` — no crash, no cache writes |
+
+### Massive API Errors
+
+| Scenario | Handling |
+|----------|----------|
+| 401 Invalid API key | Logged as error. Poller retries next interval (user may fix `.env`) |
+| 429 Rate limited | Logged. Next poll after `poll_interval` seconds |
+| Network timeout | Logged. Cache retains last-known prices |
+| Malformed snapshot (missing `last_trade`) | Individual ticker skipped via `AttributeError` catch. Others processed |
+| API returns empty list | No cache updates. SSE keeps streaming stale data |
+| Market closed | `last_trade.price` reflects last traded price (may be after-hours) |
+
+### Cache Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| First update for a ticker | `previous_price = price`, direction = `flat` |
+| `get_price()` for unknown ticker | Returns `None` |
+| Concurrent reads/writes | `threading.Lock` protects all access |
+| Remove ticker not in cache | `pop(ticker, None)` — no-op, no error |
+
+### SSE Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| Client disconnects | Detected via `request.is_disconnected()`, generator exits cleanly |
+| No price data yet | Empty cache → nothing sent. Client waits for first `data:` event |
+| Multiple SSE clients | Each gets independent generator, all read from same cache |
+| Cache unchanged between ticks | Version check skips send — no redundant payloads |
+
+### Watchlist Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| Add invalid/nonexistent symbol | Simulator: random seed price. Massive: no snapshot returned, silently skipped |
+| Add ticker already in watchlist | No-op at both DB (UNIQUE constraint) and source level |
+| Remove ticker with open position | Allowed — position persists, just no live price updates |
+
