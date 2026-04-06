@@ -389,3 +389,63 @@ class GBMSimulator:
 
 Correlation uses Cholesky decomposition of a sector-based matrix. `_rebuild_cholesky()` is called on add/remove — O(n^2) but n < 50.
 
+
+### 6.2 SimulatorDataSource — Async Wrapper
+
+Wraps `GBMSimulator` in a background `asyncio.Task` and writes to `PriceCache`.
+
+```python
+class SimulatorDataSource(MarketDataSource):
+    def __init__(self, price_cache: PriceCache, update_interval=0.5, event_probability=0.001):
+        self._cache = price_cache
+        self._interval = update_interval
+        self._event_prob = event_probability
+        self._sim: GBMSimulator | None = None
+        self._task: asyncio.Task | None = None
+
+    async def start(self, tickers: list[str]) -> None:
+        self._sim = GBMSimulator(tickers=tickers, event_probability=self._event_prob)
+        # Seed cache immediately so SSE has data on first tick
+        for ticker in tickers:
+            price = self._sim.get_price(ticker)
+            if price is not None:
+                self._cache.update(ticker=ticker, price=price)
+        self._task = asyncio.create_task(self._run_loop(), name="simulator-loop")
+
+    async def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+
+    async def add_ticker(self, ticker: str) -> None:
+        if self._sim:
+            self._sim.add_ticker(ticker)
+            price = self._sim.get_price(ticker)
+            if price is not None:
+                self._cache.update(ticker=ticker, price=price)
+
+    async def remove_ticker(self, ticker: str) -> None:
+        if self._sim:
+            self._sim.remove_ticker(ticker)
+        self._cache.remove(ticker)
+
+    def get_tickers(self) -> list[str]:
+        return self._sim.get_tickers() if self._sim else []
+
+    async def _run_loop(self) -> None:
+        while True:
+            try:
+                if self._sim:
+                    for ticker, price in self._sim.step().items():
+                        self._cache.update(ticker=ticker, price=price)
+            except Exception:
+                logger.exception("Simulator step failed")
+            await asyncio.sleep(self._interval)
+```
+
+**Key behaviors**: immediate cache seeding on `start()`, graceful cancellation on `stop()`, exception resilience per-step (one bad tick doesn't kill the feed).
+
