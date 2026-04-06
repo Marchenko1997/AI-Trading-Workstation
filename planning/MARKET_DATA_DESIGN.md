@@ -568,3 +568,83 @@ await source.start(["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA",
 
 Imports are lazy — `massive` package is only imported when the API key is present. Simulator path requires only `numpy`.
 
+
+---
+
+## 9. SSE Streaming Endpoint
+
+**File: `backend/app/market/stream.py`**
+
+Long-lived HTTP connection that pushes price updates to the browser via `text/event-stream`. Uses a router factory to inject the `PriceCache` without globals.
+
+```python
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+from collections.abc import AsyncGenerator
+from .cache import PriceCache
+
+router = APIRouter(prefix="/api/stream", tags=["streaming"])
+
+def create_stream_router(price_cache: PriceCache) -> APIRouter:
+    @router.get("/prices")
+    async def stream_prices(request: Request) -> StreamingResponse:
+        return StreamingResponse(
+            _generate_events(price_cache, request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering
+            },
+        )
+    return router
+
+async def _generate_events(
+    price_cache: PriceCache,
+    request: Request,
+    interval: float = 0.5,
+) -> AsyncGenerator[str, None]:
+    yield "retry: 1000\n\n"  # Browser auto-reconnects after 1s
+
+    last_version = -1
+    try:
+        while True:
+            if await request.is_disconnected():
+                break
+            current_version = price_cache.version
+            if current_version != last_version:
+                last_version = current_version
+                prices = price_cache.get_all()
+                if prices:
+                    data = {t: u.to_dict() for t, u in prices.items()}
+                    yield f"data: {json.dumps(data)}\n\n"
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+```
+
+### Client-Side Usage
+
+```javascript
+const source = new EventSource("/api/stream/prices");
+source.onmessage = (event) => {
+    const prices = JSON.parse(event.data);
+    // prices = { "AAPL": { ticker, price, previous_price, change, direction, ... }, ... }
+    updateWatchlist(prices);
+};
+```
+
+### SSE Event Format
+
+```
+retry: 1000
+
+data: {"AAPL":{"ticker":"AAPL","price":191.23,"previous_price":191.20,...},...}
+
+data: {"AAPL":{"ticker":"AAPL","price":191.25,"previous_price":191.23,...},...}
+```
+
+- Version-based change detection skips sends when nothing changed (important for Massive's 15s intervals)
+- `retry: 1000` tells the browser to reconnect after 1 second on disconnect
+- `X-Accel-Buffering: no` prevents nginx from buffering the stream
+
