@@ -948,3 +948,71 @@ await source.remove_ticker("NFLX")
 await source.stop()
 ```
 
+
+---
+
+## 6 Addendum: Cholesky Correlation Detail
+
+The GBM simulator's key differentiator is **correlated** random moves across tickers. This section covers the implementation omitted from Section 6.
+
+### Correlation Matrix Construction
+
+```python
+def _rebuild_cholesky(self) -> None:
+    n = len(self._tickers)
+    if n <= 1:
+        self._cholesky = None
+        return
+    corr = np.eye(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            rho = self._pairwise_correlation(self._tickers[i], self._tickers[j])
+            corr[i, j] = rho
+            corr[j, i] = rho
+    self._cholesky = np.linalg.cholesky(corr)
+```
+
+### Pairwise Correlation Rules
+
+```python
+@staticmethod
+def _pairwise_correlation(t1: str, t2: str) -> float:
+    tech = CORRELATION_GROUPS["tech"]
+    finance = CORRELATION_GROUPS["finance"]
+    if t1 == "TSLA" or t2 == "TSLA":
+        return TSLA_CORR           # 0.3 — TSLA does its own thing
+    if t1 in tech and t2 in tech:
+        return INTRA_TECH_CORR     # 0.6
+    if t1 in finance and t2 in finance:
+        return INTRA_FINANCE_CORR  # 0.5
+    return CROSS_GROUP_CORR        # 0.3
+```
+
+### How Correlation Applies Each Tick
+
+```
+Z_independent = [z1, z2, ..., zn]    # n independent N(0,1) draws
+Z_correlated  = L @ Z_independent     # L = cholesky(correlation_matrix)
+```
+
+After this transform, `Z_correlated[i]` and `Z_correlated[j]` have correlation `rho(i,j)`. When AAPL draws a large positive Z, MSFT's Z is pulled positive too (rho=0.6), while JPM's is only weakly pulled (rho=0.3).
+
+### Example: 3-Ticker Correlation Matrix
+
+For tickers `[AAPL, MSFT, JPM]`:
+
+```
+     AAPL  MSFT  JPM
+AAPL [1.0   0.6   0.3]
+MSFT [0.6   1.0   0.3]
+JPM  [0.3   0.3   1.0]
+```
+
+Cholesky `L` of this matrix ensures `L @ L^T = C`. Independent draws multiplied by `L` produce the desired correlations — tech moves together, finance diverges.
+
+### Dynamic Ticker Management
+
+- `add_ticker()`: appends ticker, assigns seed price + params, rebuilds Cholesky
+- `remove_ticker()`: removes from list/dicts, rebuilds Cholesky
+- Rebuild is O(n^2) but n < 50 tickers — negligible cost
+
