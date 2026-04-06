@@ -513,3 +513,58 @@ class MassiveDataSource(MarketDataSource):
 
 All tickers are fetched in a **single API call** (`get_snapshot_all`) — critical for staying within the free tier's 5 req/min limit.
 
+
+---
+
+## 8. Factory
+
+**File: `backend/app/market/factory.py`**
+
+Selects the data source at startup based on environment variables.
+
+```python
+import os
+from .cache import PriceCache
+from .interface import MarketDataSource
+
+def create_market_data_source(price_cache: PriceCache) -> MarketDataSource:
+    """Create the appropriate market data source.
+
+    - MASSIVE_API_KEY set and non-empty → MassiveDataSource (real data)
+    - Otherwise → SimulatorDataSource (GBM simulation)
+
+    Returns an unstarted source. Caller must await source.start(tickers).
+    """
+    api_key = os.environ.get("MASSIVE_API_KEY", "").strip()
+
+    if api_key:
+        from .massive_client import MassiveDataSource
+        logger.info("Market data source: Massive API (real data)")
+        return MassiveDataSource(api_key=api_key, price_cache=price_cache)
+    else:
+        from .simulator import SimulatorDataSource
+        logger.info("Market data source: GBM Simulator")
+        return SimulatorDataSource(price_cache=price_cache)
+```
+
+### Usage
+
+```python
+from app.market import PriceCache, create_market_data_source
+
+cache = PriceCache()
+source = create_market_data_source(cache)
+await source.start(["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA",
+                     "NVDA", "META", "JPM", "V", "NFLX"])
+```
+
+### Selection Logic
+
+| `MASSIVE_API_KEY` env var | Result |
+|---------------------------|--------|
+| Not set | `SimulatorDataSource` |
+| Empty string / whitespace | `SimulatorDataSource` |
+| Valid key | `MassiveDataSource` |
+
+Imports are lazy — `massive` package is only imported when the API key is present. Simulator path requires only `numpy`.
+
