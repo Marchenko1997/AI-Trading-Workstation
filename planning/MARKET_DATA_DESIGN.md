@@ -648,3 +648,75 @@ data: {"AAPL":{"ticker":"AAPL","price":191.25,"previous_price":191.23,...},...}
 - `retry: 1000` tells the browser to reconnect after 1 second on disconnect
 - `X-Accel-Buffering: no` prevents nginx from buffering the stream
 
+
+---
+
+## 10. FastAPI Lifecycle Integration
+
+Wire up market data using FastAPI's `lifespan` context manager.
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from app.market import PriceCache, create_market_data_source, create_stream_router
+
+# Module-level references (accessed by route handlers)
+price_cache = PriceCache()
+market_source = None
+
+DEFAULT_TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA",
+                   "NVDA", "META", "JPM", "V", "NFLX"]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global market_source
+    # --- Startup ---
+    market_source = create_market_data_source(price_cache)
+    # Load tickers from DB watchlist (fallback to defaults)
+    tickers = await load_watchlist_tickers() or DEFAULT_TICKERS
+    await market_source.start(tickers)
+
+    yield  # App is running
+
+    # --- Shutdown ---
+    await market_source.stop()
+
+app = FastAPI(title="FinAlly", lifespan=lifespan)
+
+# Register SSE streaming router
+stream_router = create_stream_router(price_cache)
+app.include_router(stream_router)
+```
+
+### Startup Sequence
+
+1. Create `PriceCache` (empty)
+2. `create_market_data_source(cache)` — reads `MASSIVE_API_KEY`, returns unstarted source
+3. Load watchlist tickers from SQLite (or use defaults on first run)
+4. `await source.start(tickers)` — seeds cache, starts background task
+5. SSE endpoint is ready — first client gets data immediately
+
+### Shutdown Sequence
+
+1. `await source.stop()` — cancels background task, awaits clean exit
+2. `PriceCache` is garbage collected (in-memory only, no persistence needed)
+
+### Watchlist Sync
+
+When the user adds/removes a ticker via API or chat:
+
+```python
+@router.post("/api/watchlist")
+async def add_to_watchlist(body: AddTickerRequest):
+    # 1. Persist to SQLite
+    await db_add_watchlist(body.ticker)
+    # 2. Tell the data source to start tracking
+    await market_source.add_ticker(body.ticker)
+
+@router.delete("/api/watchlist/{ticker}")
+async def remove_from_watchlist(ticker: str):
+    await db_remove_watchlist(ticker)
+    await market_source.remove_ticker(ticker)  # Also clears from PriceCache
+```
+
