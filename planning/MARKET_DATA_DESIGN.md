@@ -449,3 +449,67 @@ class SimulatorDataSource(MarketDataSource):
 
 **Key behaviors**: immediate cache seeding on `start()`, graceful cancellation on `stop()`, exception resilience per-step (one bad tick doesn't kill the feed).
 
+
+---
+
+## 7. Massive API Client
+
+**File: `backend/app/market/massive_client.py`**
+
+Polls the Massive (Polygon.io) REST snapshot endpoint. Synchronous client runs in `asyncio.to_thread()` to avoid blocking the event loop.
+
+```python
+from massive import RESTClient
+from massive.rest.models import SnapshotMarketType
+
+class MassiveDataSource(MarketDataSource):
+    def __init__(self, api_key: str, price_cache: PriceCache, poll_interval=15.0):
+        self._api_key = api_key
+        self._cache = price_cache
+        self._interval = poll_interval
+        self._tickers: list[str] = []
+        self._task: asyncio.Task | None = None
+        self._client: RESTClient | None = None
+
+    async def start(self, tickers: list[str]) -> None:
+        self._client = RESTClient(api_key=self._api_key)
+        self._tickers = list(tickers)
+        await self._poll_once()  # Immediate first poll
+        self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
+
+    async def _poll_once(self) -> None:
+        if not self._tickers or not self._client:
+            return
+        try:
+            snapshots = await asyncio.to_thread(self._fetch_snapshots)
+            for snap in snapshots:
+                try:
+                    self._cache.update(
+                        ticker=snap.ticker,
+                        price=snap.last_trade.price,
+                        timestamp=snap.last_trade.timestamp / 1000.0,  # ms → s
+                    )
+                except (AttributeError, TypeError) as e:
+                    logger.warning("Skipping snapshot for %s: %s",
+                                   getattr(snap, "ticker", "???"), e)
+        except Exception as e:
+            logger.error("Massive poll failed: %s", e)
+
+    def _fetch_snapshots(self) -> list:
+        return self._client.get_snapshot_all(
+            market_type=SnapshotMarketType.STOCKS,
+            tickers=self._tickers,
+        )
+```
+
+### Error Resilience
+
+| Error | Behavior |
+|-------|----------|
+| 401 Unauthorized | Logged. Poller keeps running — user may fix `.env` and restart. |
+| 429 Rate Limited | Logged. Retries automatically on next interval. |
+| Network timeout | Logged. Cache retains last-known prices. |
+| Malformed snapshot | Individual ticker skipped. Others still processed. |
+
+All tickers are fetched in a **single API call** (`get_snapshot_all`) — critical for staying within the free tier's 5 req/min limit.
+
