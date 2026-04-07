@@ -33,8 +33,11 @@ TICKER_PARAMS: dict[str, dict[str, float]] = {
 # Default parameters for tickers not in the list above (dynamically added)
 DEFAULT_PARAMS: dict[str, float] = {"sigma": 0.25, "mu": 0.05}
 
-# Correlation groups for the simulator's Cholesky decomposition
-# Tickers in the same group have higher intra-group correlation
+# Correlation groups for the simulator's Cholesky decomposition.
+# Tickers in the same group have higher intra-group correlation.
+# Note: TSLA is intentionally absent from all groups — it uses TSLA_CORR
+# (0.3) against every other ticker regardless of sector, reflecting its
+# historically low correlation with both tech and finance peers.
 CORRELATION_GROUPS: dict[str, set[str]] = {
     "tech": {"AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA", "NFLX"},
     "finance": {"JPM", "V"},
